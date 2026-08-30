@@ -58,7 +58,37 @@ Also cleaned up:
 Symbol-table verification (`x86_64-w64-mingw32-objdump -t`):
 `NtCreateThreadEx` present, `CreateRemoteThread` **gone** from imports.
 
-### `patches-v2` — polish on top of patches-v1
+### `patches-v3` — critical bugfix (current release)
+
+**Anyone on `patches-v2` should upgrade.** The `patches-v2` [P5] "zero
+the local view before unmap" step was destructive — the local view and
+the remote view are two mappings of the SAME section pages, so zeroing
+the local view also zeros what the target process sees. The injected
+thread would then jump to NUL bytes and crash the target the instant
+`NtCreateThreadEx` returned (reproduced by injecting into `notepad.exe`
+— the process died immediately).
+
+Fix:
+
+- Removed the destructive `zero_fill_bytes(baseAddrLocal, ...)` call.
+- The other two `[P5]` steps stay in — zeroing the beacon-owned
+  shellcode buffer (a separate allocation, safe to scrub) and NULL'ing
+  our local pointer.
+- `NtUnmapViewOfSection(hLocalProcess, baseAddrLocal)` already removes
+  our view; the target keeps its remote view. That alone is sufficient
+  anti-forensics from our side.
+- Code-site comment expanded with a correctness note so a future editor
+  doesn't re-introduce the same bug.
+
+No other changes — the technique class, the primitives (RWX section,
+RX remote view, `NtCreateThreadEx` with HIDE_FROM_DEBUGGER, SEC_NO_CHANGE,
+minimal target rights, NTSTATUS names, handle hygiene) are all unchanged.
+
+### `patches-v2` — polish on top of patches-v1 (superseded by patches-v3)
+
+> ⚠ **Do not use `patches-v2` in production** — see `patches-v3` above for
+> the bugfix. Kept as a historical checkpoint.
+
 
 Small, non-brittle improvements. None of these change the injection
 technique class — the underlying section-mapping + `NtCreateThreadEx` flow
@@ -84,11 +114,12 @@ is unchanged.
 |-----|-------|-------|
 | upstream | 3273 | apokryptein/secinject at fork point |
 | `patches-v1` | 3498 | Thread swap + rights narrowing + error paths |
-| `patches-v2` | 5809 | Adds NTSTATUS switch table + zero-fill helper + expanded format strings. No new imports beyond patches-v1. |
+| `patches-v2` | 5809 | Adds NTSTATUS switch table + zero-fill helper + expanded format strings. **Superseded — do not use.** |
+| `patches-v3` | ~5750 | Removes the destructive local-view scrub from patches-v2 [P5]. Byte-identical technique otherwise. **Current release.** |
 
-### Symbol-table verification (post-patches-v2)
+### Symbol-table verification (post-patches-v3)
 
-Post-`patches-v2`, `objdump -t dist/secinject.x64.o` shows:
+Post-`patches-v3`, `objdump -t dist/secinject.x64.o` shows:
 
 - `__imp_KERNEL32$OpenProcess` — present
 - `__imp_KERNEL32$GetLastError` — present (new in patches-v1)
